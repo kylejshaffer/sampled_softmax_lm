@@ -3,9 +3,10 @@ import sys
 import string
 
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 
-def get_bpe_vocab(vocab_file):
+def get_vocab(vocab_file):
     special_toks = ['<s>', '</s>', '<UNK>', '<PAD>']
     c = {}
     word_idx = 1
@@ -42,6 +43,44 @@ def get_char_vocab(vocab_file):
                     char_map[st] = max(char_map.values()) + 1
     print('CHARACTER VOCAB SIZE = {}'.format(len(char_map)))
     return char_map
+
+def compute_vocab(infile, outfile):
+    from collections import Counter
+
+    counter = Counter()
+
+    with open(infile, encoding='utf8', mode='r') as infile:
+        for line in infile:
+            counter.update(line.strip().split())
+
+    print('Total vocab is {} tokens'.format(len(counter)))
+    output_vocab = pd.DataFrame.from_dict(counter, orient='index').reset_index()
+    output_vocab.columns = ['word', 'freq']
+    output_vocab.sort_values(by='freq', ascending=False).to_csv(outfile, sep='\t', encoding='utf8', index=False)
+    print('vocab written out')
+
+def compute_vocab_threshold(vocab_file, freq_thresh):
+    vocab_df = pd.read_csv(vocab_file, sep='\t', encoding='utf8')
+    total_word_occurrences = vocab_df.freq.sum()
+    n_tokens = vocab_df[vocab_df.freq >= freq_thresh].shape[0]
+    print('Number of tokens at {} threshold: {}'.format(freq_thresh, n_tokens))
+    print('Percentage of word occurrences accounted for:', (vocab_df[vocab_df.freq >= freq_thresh]['freq'].sum() / total_word_occurrences))
+    print('Sample of low-frequency words:')
+    print(vocab_df[vocab_df.freq >= freq_thresh].tail(10))
+
+def write_out_vocab(vocab_infile, vocab_outfile, freq_thresh):
+    vocab_df = pd.read_csv(vocab_infile, sep='\t', encoding='utf8')
+    vocab_subset = vocab_df[vocab_df.freq >= freq_thresh]
+    with open(vocab_outfile, encoding='utf8', mode='w') as outfile:
+        for w in vocab_subset.word.tolist():
+            if isinstance(w, float) or isinstance(w, int):
+                outfile.write(str(w))
+            else:
+                outfile.write(w)
+            outfile.write('\n')
+        outfile.write('<s>\n')
+        outfile.write('</s>\n')
+        outfile.write('<UNK>\n')
 
 def test():
     import matplotlib.pyplot as plt
