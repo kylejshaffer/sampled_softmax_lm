@@ -66,11 +66,10 @@ class BidirectionalLM(object):
     def sparse_loss(self, y_true, y_pred, from_logits=True):
         return K.sparse_categorical_crossentropy(y_true, y_pred, from_logits)
 
-    def tf_loss(self, logits, targets, weights, average_across_timesteps=True, average_across_batch=True):
+    def tf_s2s_loss(self, logits, targets, weights, average_across_timesteps=True, average_across_batch=True):
         return tf.contrib.seq2seq.sequence_loss(logits, targets, weights, average_across_timesteps, average_across_batch)
 
     def build_graph(self):
-        in_layer = Input(shape=(None,))
         self._init_layers()
         embedded = self.embedding_layer(in_layer)
         embedded = self.embedding_dropout_layer(embedded)
@@ -83,9 +82,9 @@ class BidirectionalLM(object):
             else:
                 fw_encoded = fw_layer(fw_bw_context)
                 bw_encoded = bw_layer(fw_bw_context)
-            fw_context = Lambda(lambda x: x[:, :-2, :])(fw_encoded)
-            bw_context = Lambda(lambda x: x[:, 2:, :])(bw_encoded)
-            fw_bw_context = Concatenate(axis=-1)([fw_context, bw_context])
+            # fw_context = Lambda(lambda x: x[:, :-2, :])(fw_encoded)
+            # bw_context = Lambda(lambda x: x[:, 2:, :])(bw_encoded)
+            fw_bw_context = Concatenate(axis=-1)([fw_encoded, bw_encoded])
 
         final_fw_layer = self.fwd_layers[-1]
         final_bw_layer = self.bwd_layers[-1]
@@ -95,11 +94,11 @@ class BidirectionalLM(object):
         final_bw_context = Lambda(lambda x: x[:, 2:, :])(final_bw)
         final_encoded_context = Concatenate(axis=-1)([final_fw_context, final_bw_context])
 
-        # encoded_projection = self.proj_layer(final_encoded_context)
-        logits = self.logits_layer(final_encoded_context)
+        encoded_projection = self.proj_layer(final_encoded_context)
+        logits = self.logits_layer(encoded_projection)
 
         self.W, self.b = self.logits_layer.weights[0], self.logits_layer.weights[-1]
-        self.model = Model(inputs=in_layer, outputs=logits)
+        self.model = Model(inputs=self.input_seq, outputs=logits)
         self.model.compile(loss=self.sparse_loss, optimizer=self.opt_string, target_tensors=[self.output_seq])
         self.model.summary()
 
@@ -139,8 +138,8 @@ class BidirectionalLM(object):
         valid_data = utils.LanguageModelData(data_file=self.valid_file, vocab=self.vocab,
                                              max_seq_len=self.seq_len, batch_size=self.valid_batch_size)
 
-        train_datagen = train_data.generate_batches()
-        valid_datagen = valid_data.generate_batches()
+        train_datagen = train_data.generate_batches(mask=True)
+        valid_datagen = valid_data.generate_batches(mask=True)
 
         ckpt_fname = 'bidi_lm_{epoch:02d}-{val_loss:.2f}.h5'
         ckpt = ModelCheckpoint(ckpt_fname, monitor='val_loss', verbose=1, save_best_only=True, mode='min')

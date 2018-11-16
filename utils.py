@@ -152,7 +152,7 @@ class LanguageModelData(object):
                 y_batch[idx] = y_padded
         return x_batch, y_batch
 
-    def generate_batches(self):
+    def generate_batches(self, mask=False):
         while True:
             x_batch, y_batch, seq_lengths  = [], [], []
             for x_toks, y_toks in self.get_line():
@@ -163,12 +163,18 @@ class LanguageModelData(object):
                 seq_lengths.append(len(x_toks))
                 if len(x_batch) == self.batch_size:
                     x_batch_padded, y_batch_padded = self.padding(x_batch, y_batch, seq_lengths)
-                    yield np.asarray(x_batch_padded), np.asarray(y_batch_padded)
+                    x_batch_out, y_batch_out = np.asarray(x_batch_padded), np.asarray(y_batch_padded)
+                    if mask:
+                        y_batch_out = y_batch_out[:, 1:-1]
+                    yield x_batch_out, y_batch_out
                     # Reset batch containers
                     x_batch, y_batch, seq_lengths  = [], [], []
             if len(x_batch) > 0:
                 x_batch_padded, y_batch_padded = self.padding(x_batch, y_batch, seq_lengths)
-                yield np.asarray(x_batch_padded), np.asarray(y_batch_padded)
+                x_batch_out, y_batch_out = np.asarray(x_batch_padded), np.asarray(y_batch_padded)
+                if mask:
+                    y_batch_out = y_batch_out[:, 1:-1]
+                yield x_batch_out, y_batch_out
 
 class BiRNNData(LanguageModelData):
     def __init__(self, data_file, vocab, max_seq_len, batch_size):
