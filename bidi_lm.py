@@ -24,6 +24,7 @@ class BidirectionalLM(object):
         self.train_file = train_file
         self.valid_file = valid_file
         self.model_name = model_name
+        # TF session setup
         self.config = tf.ConfigProto(allow_soft_placement=True)
         self.sess = tf.Session(config=self.config)
         K.set_session(self.sess)
@@ -45,14 +46,14 @@ class BidirectionalLM(object):
         # self.visualize_gradients = args.visualize_gradients
         self._choose_optimizer()
         self.build_graph()
-        # self.compile()
+        self.compile()
         # self._tboard_setup()
-        # self.saver = tf.train.Saver()
+        self.saver = tf.train.Saver()
 
     def _init_layers(self):
         # Sequence placeholders
-        # self.input_seq = tf.placeholder(dtype=tf.int32, shape=[None, None], name='x_input')
-        self.input_seq = Input(shape=(None,), name='x_input')
+        # self.input_seq = Input(shape=(None,), name='x_input')
+        self.input_seq = tf.placeholder(dtype=tf.int32, shape=[None, None], name='x_input')
         self.output_seq = tf.placeholder(dtype=tf.int32, shape=[None, None], name='y_output')
 
         self.embedding_layer = Embedding(input_dim=self.vocab_size, output_dim=self.embedding_dim,
@@ -66,12 +67,9 @@ class BidirectionalLM(object):
     def sparse_loss(self, y_true, y_pred, from_logits=True):
         return K.sparse_categorical_crossentropy(y_true, y_pred, from_logits)
 
-    def tf_s2s_loss(self, logits, targets, weights, average_across_timesteps=True, average_across_batch=True):
-        return tf.contrib.seq2seq.sequence_loss(logits, targets, weights, average_across_timesteps, average_across_batch)
-
     def build_graph(self):
         self._init_layers()
-        embedded = self.embedding_layer(in_layer)
+        embedded = self.embedding_layer(self.input_seq)
         embedded = self.embedding_dropout_layer(embedded)
         for layer_idx in list(range(len(self.fwd_layers)))[:-1]:
             fw_layer = self.fwd_layers[layer_idx]
@@ -82,8 +80,6 @@ class BidirectionalLM(object):
             else:
                 fw_encoded = fw_layer(fw_bw_context)
                 bw_encoded = bw_layer(fw_bw_context)
-            # fw_context = Lambda(lambda x: x[:, :-2, :])(fw_encoded)
-            # bw_context = Lambda(lambda x: x[:, 2:, :])(bw_encoded)
             fw_bw_context = Concatenate(axis=-1)([fw_encoded, bw_encoded])
 
         final_fw_layer = self.fwd_layers[-1]
@@ -98,9 +94,26 @@ class BidirectionalLM(object):
         logits = self.logits_layer(encoded_projection)
 
         self.W, self.b = self.logits_layer.weights[0], self.logits_layer.weights[-1]
-        self.model = Model(inputs=self.input_seq, outputs=logits)
-        self.model.compile(loss=self.sparse_loss, optimizer=self.opt_string, target_tensors=[self.output_seq])
-        self.model.summary()
+
+        # Reshape input for sampled-softmax
+        inputs_reshaped = tf.reshape(final_encoded_context, [-1, int(final_encoded_context.get_shape()[2])])
+        weights_reshaped = tf.transpose(self.W)
+        labels_reshaped = tf.reshape(self.output_seq, [-1, 1])
+
+        # Set up training loss
+        self.train_step_loss = tf.nn.sampled_softmax_loss(weights=weights_reshaped, biases=self.b, inputs=inputs_reshaped,
+                                                          labels=labels_reshaped, num_sampled=self.num_sampled, num_classes=self.vocab_size)
+
+        self.valid_step_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.output_seq, logits=logits)
+
+        self.train_loss = tf.reduce_mean(self.train_step_loss)
+        self.valid_loss = tf.reduce_mean(self.valid_step_loss)
+
+        self.train_op = self.optimizer.minimize(self.train_loss)
+
+        # self.model = Model(inputs=self.input_seq, outputs=logits)
+        # self.model.compile(loss=self.sparse_loss, optimizer=self.opt_string, target_tensors=[self.output_seq])
+        # self.model.summary()
 
     def _choose_optimizer(self):
         assert self.opt_string in {'adagrad', 'adadelta', 'adam', 'sgd', 'momentum', 'rmsprop'}, 'Please select valid optimizer!'
@@ -113,7 +126,7 @@ class BidirectionalLM(object):
         elif self.opt_string == 'adadelta':
             self.optimizer = tf.train.AdadeltaOptimizer()
         elif self.opt_string == 'adam':
-            self.optimizer = keras.optimizers.Adam()
+            self.optimizer = tf.train.AdamOptimizer()
         elif self.opt_string == 'rmsprop':
             self.optimizer = tf.train.RMSPropOptimizer(learning_rate=learning_rate)
         elif self.opt_string == 'sgd':
@@ -127,6 +140,17 @@ class BidirectionalLM(object):
     def compile(self):
         self.sess.run(tf.global_variables_initializer())
 
+    def _train_on_batch(self, x_batch, y_batch):
+        _, loss_ = self.sess.run([self.train_op, self.train_loss],
+                                feed_dict={self.input_seq: x_batch,
+                                self.output_seq: y_batch})
+        return loss_
+
+    def _eval_on_batch(self, x, y, normalize=False):
+        valid_loss_ = self.sess.run(self.valid_loss, feed_dict={self.input_seq: x,
+                                                                self.output_seq: y})
+        return valid_loss_
+
     def train(self):
         np.random.seed(7)
 
@@ -138,14 +162,64 @@ class BidirectionalLM(object):
         valid_data = utils.LanguageModelData(data_file=self.valid_file, vocab=self.vocab,
                                              max_seq_len=self.seq_len, batch_size=self.valid_batch_size)
 
-        train_datagen = train_data.generate_batches(mask=True)
-        valid_datagen = valid_data.generate_batches(mask=True)
+        # ckpt_fname = 'bidi_lm_{epoch:02d}-{val_loss:.2f}.h5'
+        # ckpt = ModelCheckpoint(ckpt_fname, monitor='val_loss', verbose=1, save_best_only=True, mode='min')
+        # self.model.fit_generator(generator=train_datagen, steps_per_epoch=n_train_iters,
+        #                         epochs=self.epochs, validation_data=valid_datagen, validation_steps=n_valid_iters,
+        #                         callbacks=[ckpt])
 
-        ckpt_fname = 'bidi_lm_{epoch:02d}-{val_loss:.2f}.h5'
-        ckpt = ModelCheckpoint(ckpt_fname, monitor='val_loss', verbose=1, save_best_only=True, mode='min')
-        self.model.fit_generator(generator=train_datagen, steps_per_epoch=n_train_iters,
-                                epochs=self.epochs, validation_data=valid_datagen, validation_steps=n_valid_iters,
-                                callbacks=[ckpt])
+        for e in range(self.epochs):
+            train_datagen = train_data.generate_batches(mask=True)
+            valid_datagen = valid_data.generate_batches(mask=True)
+
+            all_train_loss = 0
+            batch_cnt = 0
+            samples_cnt = 0
+
+            for train_iter in range(n_train_iters):
+                x_batch, y_batch = next(train_datagen)
+                if (samples_cnt % self.eval_thresh == 0) and (batch_cnt > 0):
+                    self.evaluate(valid_generator=valid_datagen)
+                    self.save()
+
+                loss_ = self._train_on_batch(x_batch, y_batch)
+
+                batch_cnt += 1
+                all_train_loss += loss_
+                samples_cnt += len(x_batch)
+                update_loss = all_train_loss / batch_cnt
+                sys.stdout.write('\r num_samples_trained: {} \t|\t loss : {:8.3f} \t|\t prpl : {:8.3f}'.format((samples_cnt),
+                                  update_loss, np.exp(update_loss)))
+
+            # Epoch summary metrics
+            print('\n\nEPOCH {} METRICS'.format(e+1))
+            print('=' * 60)
+            self.evaluate(valid_generator=valid_datagen, num_eval_examples=self.num_val_examples)
+            print('\n\n')
+            self.save(ckpt_name='model_epoch{}.ckpt'.format(e+1))
+
+    def evaluate(self, valid_generator, num_eval_examples=10000):
+        n_batch_iters = num_eval_examples // self.batch_size
+        total_val_loss = 0
+        val_batch_cntr = 0
+        print('\n\nvalidating...')
+        for i in range(n_batch_iters):
+            print('=', end='', flush=True)
+            val_batch_cntr += 1
+            x_val_batch, y_val_batch = next(valid_generator)
+            valid_loss_ = self._eval_on_batch(x=x_val_batch, y=y_val_batch)
+            total_val_loss += valid_loss_
+
+        report_loss = total_val_loss / val_batch_cntr
+        print('\nValidation metrics - loss: {:8.3f} | prpl: {:8.3f}\n'.format(report_loss, np.exp(report_loss)))
+
+    def save(self, save_path='./', ckpt_name='model.ckpt'):
+        self.saver.save(self.sess, save_path + ckpt_name)
+        print("Model saved to file:", save_path)
+
+    def load(self, load_path='./', ckpt_name='model.ckpt'):
+        self.saver.restore(self.sess, save_path + ckpt_name)
+        print('Model restored.')
 
 
 if __name__ == '__main__':
