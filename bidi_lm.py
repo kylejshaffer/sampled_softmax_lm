@@ -30,10 +30,10 @@ class BidirectionalLM(object):
         K.set_session(self.sess)
         self.num_train_examples = args.num_train_examples
         self.num_val_examples = args.num_val_examples
-        self.eval_thresh = args.print_freq
         self.batch_size = args.batch_size
-        self.valid_batch_size = 256
+        self.valid_batch_size = 160
         self.epochs = args.epochs
+        self.eval_thresh = self._set_eval_thresh()
         self.seq_len = args.seq_len
         self.vocab_size = len(self.vocab)
         self.embedding_dim = args.embedding_dim
@@ -50,14 +50,20 @@ class BidirectionalLM(object):
         # self._tboard_setup()
         self.saver = tf.train.Saver()
 
+    def _set_eval_thresh(self):
+        n_train_iters = self.num_train_examples // self.batch_size
+        eval_every = n_train_iters // 20
+        return eval_every
+
     def _init_layers(self):
         # Sequence placeholders
-        # self.input_seq = Input(shape=(None,), name='x_input')
         self.input_seq = tf.placeholder(dtype=tf.int32, shape=[None, None], name='x_input')
         self.output_seq = tf.placeholder(dtype=tf.int32, shape=[None, None], name='y_output')
+        self.output_seq_bw = tf.reverse(self.output_seq, axis=[1])
 
         self.embedding_layer = Embedding(input_dim=self.vocab_size, output_dim=self.embedding_dim,
-                                        embeddings_initializer='glorot_uniform', name='embedding')
+                                        embeddings_initializer='glorot_uniform', name='embedding',
+                                        mask_zero=True)
         self.embedding_dropout_layer = Dropout(self.embedding_dropout, name='embedding_dropout')
         self.fwd_layers = [LSTM(units=self.hidden_dim, return_sequences=True, go_backwards=False) for _ in range(self.num_hidden_layers)]
         self.bwd_layers = [LSTM(units=self.hidden_dim, return_sequences=True, go_backwards=True) for _ in range(self.num_hidden_layers)]
@@ -78,38 +84,57 @@ class BidirectionalLM(object):
                 fw_encoded = fw_layer(embedded)
                 bw_encoded = bw_layer(embedded)
             else:
-                fw_encoded = fw_layer(fw_bw_context)
-                bw_encoded = bw_layer(fw_bw_context)
-            fw_bw_context = Concatenate(axis=-1)([fw_encoded, bw_encoded])
+                fw_encoded = fw_layer(fw_encoded)
+                bw_encoded = bw_layer(bw_encoded)
 
         final_fw_layer = self.fwd_layers[-1]
         final_bw_layer = self.bwd_layers[-1]
-        final_fw = final_fw_layer(fw_bw_context)
-        final_bw = final_bw_layer(fw_bw_context)
-        final_fw_context = Lambda(lambda x: x[:, :-2, :])(final_fw)
-        final_bw_context = Lambda(lambda x: x[:, 2:, :])(final_bw)
-        final_encoded_context = Concatenate(axis=-1)([final_fw_context, final_bw_context])
+        final_fw = final_fw_layer(fw_encoded)
+        final_bw = final_bw_layer(bw_encoded)
+        # final_fw_context = Lambda(lambda x: x[:, :-2, :])(final_fw)
+        # final_bw_context = Lambda(lambda x: x[:, 2:, :])(final_bw)
+        # final_encoded_context = Concatenate(axis=-1)([final_fw_context, final_bw_context])
 
-        encoded_projection = self.proj_layer(final_encoded_context)
-        logits = self.logits_layer(encoded_projection)
+        fw_encoded_projection = self.proj_layer(final_fw)
+        bw_encoded_projection = self.proj_layer(final_bw)
+
+        logits_fw = self.logits_layer(fw_encoded_projection)
+        logits_bw = self.logits_layer(bw_encoded_projection)
 
         self.W, self.b = self.logits_layer.weights[0], self.logits_layer.weights[-1]
 
         # Reshape input for sampled-softmax
-        inputs_reshaped = tf.reshape(final_encoded_context, [-1, int(final_encoded_context.get_shape()[2])])
+        # inputs_reshaped = tf.reshape(final_encoded_context, [-1, int(final_encoded_context.get_shape()[2])])
+        inputs_reshaped_fw = tf.reshape(fw_encoded_projection, [-1, int(fw_encoded_projection.get_shape()[2])])
+        inputs_reshaped_bw = tf.reshape(bw_encoded_projection, [-1, int(bw_encoded_projection.get_shape()[2])])
         weights_reshaped = tf.transpose(self.W)
-        labels_reshaped = tf.reshape(self.output_seq, [-1, 1])
+        labels_reshaped_fw = tf.reshape(self.output_seq, [-1, 1])
+        labels_reshaped_bw = tf.reshape(self.output_seq_bw, [-1, 1])
 
         # Set up training loss
-        self.train_step_loss = tf.nn.sampled_softmax_loss(weights=weights_reshaped, biases=self.b, inputs=inputs_reshaped,
-                                                          labels=labels_reshaped, num_sampled=self.num_sampled, num_classes=self.vocab_size)
+        # self.train_step_loss = tf.nn.sampled_softmax_loss(weights=weights_reshaped, biases=self.b, inputs=inputs_reshaped,
+        #                                                   labels=labels_reshaped, num_sampled=self.num_sampled, num_classes=self.vocab_size)
+        self.train_step_loss_fw = tf.nn.sampled_softmax_loss(weights=weights_reshaped, biases=self.b, inputs=inputs_reshaped_fw,
+                                                             labels=labels_reshaped_fw, num_sampled=self.num_sampled, num_classes=self.vocab_size)
+        self.train_step_loss_bw = tf.nn.sampled_softmax_loss(weights=weights_reshaped, biases=self.b, inputs=inputs_reshaped_bw,
+                                                             labels=labels_reshaped_bw, num_sampled=self.num_sampled, num_classes=self.vocab_size)
+        self.train_loss_fw = tf.reduce_mean(self.train_step_loss_fw)
+        self.train_loss_bw = tf.reduce_mean(self.train_step_loss_bw)
+        self.train_loss_joint = self.train_loss_fw + self.train_loss_bw
+        self.train_op = self.optimizer.minimize(self.train_loss_joint)
 
-        self.valid_step_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.output_seq, logits=logits)
 
-        self.train_loss = tf.reduce_mean(self.train_step_loss)
-        self.valid_loss = tf.reduce_mean(self.valid_step_loss)
+        # self.valid_step_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.output_seq, logits=logits)
+        self.valid_step_loss_fw = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.output_seq, logits=logits_fw)
+        self.valid_step_loss_bw = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.output_seq_bw, logits=logits_bw)
+        self.valid_loss_fw = tf.reduce_mean(self.valid_step_loss_fw)
+        self.valid_loss_bw = tf.reduce_mean(self.valid_step_loss_bw)
+        self.valid_loss_joint = self.train_loss_fw + self.train_loss_bw
 
-        self.train_op = self.optimizer.minimize(self.train_loss)
+        # self.train_loss = tf.reduce_mean(self.train_step_loss)
+        # self.valid_loss = tf.reduce_mean(self.valid_step_loss)
+
+        # self.train_op = self.optimizer.minimize(self.train_loss)
 
         # self.model = Model(inputs=self.input_seq, outputs=logits)
         # self.model.compile(loss=self.sparse_loss, optimizer=self.opt_string, target_tensors=[self.output_seq])
@@ -141,13 +166,13 @@ class BidirectionalLM(object):
         self.sess.run(tf.global_variables_initializer())
 
     def _train_on_batch(self, x_batch, y_batch):
-        _, loss_ = self.sess.run([self.train_op, self.train_loss],
+        _, loss_ = self.sess.run([self.train_op, self.train_loss_joint],
                                 feed_dict={self.input_seq: x_batch,
                                 self.output_seq: y_batch})
         return loss_
 
     def _eval_on_batch(self, x, y, normalize=False):
-        valid_loss_ = self.sess.run(self.valid_loss, feed_dict={self.input_seq: x,
+        valid_loss_ = self.sess.run(self.valid_loss_joint, feed_dict={self.input_seq: x,
                                                                 self.output_seq: y})
         return valid_loss_
 
@@ -155,7 +180,7 @@ class BidirectionalLM(object):
         np.random.seed(7)
 
         n_train_iters = self.num_train_examples // self.batch_size
-        n_valid_iters = self.num_val_examples // self.batch_size
+        n_valid_iters = self.num_val_examples // self.valid_batch_size
 
         train_data = utils.LanguageModelData(data_file=self.train_file, vocab=self.vocab,
                                              max_seq_len=self.seq_len, batch_size=self.batch_size)
@@ -169,8 +194,8 @@ class BidirectionalLM(object):
         #                         callbacks=[ckpt])
 
         for e in range(self.epochs):
-            train_datagen = train_data.generate_batches(mask=True)
-            valid_datagen = valid_data.generate_batches(mask=True)
+            train_datagen = train_data.generate_batches(mask=False)
+            valid_datagen = valid_data.generate_batches(mask=False)
 
             all_train_loss = 0
             batch_cnt = 0
@@ -178,7 +203,7 @@ class BidirectionalLM(object):
 
             for train_iter in range(n_train_iters):
                 x_batch, y_batch = next(train_datagen)
-                if (samples_cnt % self.eval_thresh == 0) and (batch_cnt > 0):
+                if (batch_cnt % self.eval_thresh == 0) and (batch_cnt > 0):
                     self.evaluate(valid_generator=valid_datagen)
                     self.save()
 
@@ -189,7 +214,7 @@ class BidirectionalLM(object):
                 samples_cnt += len(x_batch)
                 update_loss = all_train_loss / batch_cnt
                 sys.stdout.write('\r num_samples_trained: {} \t|\t loss : {:8.3f} \t|\t prpl : {:8.3f}'.format((samples_cnt),
-                                  update_loss, np.exp(update_loss)))
+                                  (update_loss / 2), (np.exp(update_loss / 2))))
 
             # Epoch summary metrics
             print('\n\nEPOCH {} METRICS'.format(e+1))
@@ -199,7 +224,7 @@ class BidirectionalLM(object):
             self.save(ckpt_name='model_epoch{}.ckpt'.format(e+1))
 
     def evaluate(self, valid_generator, num_eval_examples=10000):
-        n_batch_iters = num_eval_examples // self.batch_size
+        n_batch_iters = num_eval_examples // self.valid_batch_size
         total_val_loss = 0
         val_batch_cntr = 0
         print('\n\nvalidating...')
@@ -211,7 +236,7 @@ class BidirectionalLM(object):
             total_val_loss += valid_loss_
 
         report_loss = total_val_loss / val_batch_cntr
-        print('\nValidation metrics - loss: {:8.3f} | prpl: {:8.3f}\n'.format(report_loss, np.exp(report_loss)))
+        print('\nValidation metrics - loss: {:8.3f} | prpl: {:8.3f}\n'.format((report_loss / 2), (np.exp(report_loss / 2))))
 
     def save(self, save_path='./', ckpt_name='model.ckpt'):
         self.saver.save(self.sess, save_path + ckpt_name)
