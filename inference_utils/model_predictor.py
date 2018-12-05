@@ -48,7 +48,7 @@ class ModelPredictor(object):
             toks = input_sent.strip().split()
         tok_ids = [self.vocab.get_id(w) for w in toks]
         tok_ids.insert(0, self.vocab.bos)
-        tok_ids.append(self.vocab.eos)
+        # tok_ids.append(self.vocab.eos)
         return tok_ids
 
     def score_sent(self, sent, use_nltk=False, normalize_with_length=True):
@@ -66,7 +66,7 @@ class ModelPredictor(object):
             output_fw.append(fw_score)
             output_bw.append(bw_score)
 
-        final_scores = [((fw_score + bw_score) / 2) for fw_score, bw_score in zip(output_fw, output_bw[::-1])]
+        final_scores = [((fw_score + bw_score) / 2) for fw_score, bw_score in zip(output_fw, output_bw)]
         
         if normalize_with_length:
             sent_score = sum(final_scores) / len(final_scores)
@@ -81,15 +81,32 @@ class ModelPredictor(object):
         logprobs_fw = self.sess.run(self.predictions_fw, feed_dict={self.x_ph: prediction_sent_ids})
         logprobs_bw = np.flip(self.sess.run(self.predictions_bw, feed_dict={self.x_ph: prediction_sent_ids}), axis=0)
 
-        # Add 1 to index to account for <s> tag at beginning
-        word_logprobs_fw = logprobs_fw[(word_idx + 1), :]
-        word_logprobs_bw = logprobs_bw[(word_idx + 1), :]
+        word_logprobs_fw = logprobs_fw[word_idx, :]
+        word_logprobs_bw = logprobs_bw[word_idx, :]
 
-        word_slot_scores = [((fw_score + bw_score) / 2) for fw_score, bw_score in zip(word_logprobs_fw, word_logprobs_bw)]
-        scored_words = sorted(list(zip(range(len(word_slot_scores)), word_slot_scores)), key=lambda x: x[-1], reverse=True)[:n_best]
-        ranked_word_ids = [scored_word[0] for scored_word in scored_words]
+        # word_slot_scores = [((fw_score + bw_score) / 2) for fw_score, bw_score in zip(word_logprobs_fw, word_logprobs_bw)]
+        # scored_words = sorted(list(zip(range(len(word_slot_scores)), word_slot_scores)), key=lambda x: x[-1], reverse=True)[:n_best]
+        # ranked_word_ids = [scored_word[0] for scored_word in scored_words]
 
-        return ranked_word_ids
+        scored_fw = sorted(list(zip(range(len(word_logprobs_fw)), word_logprobs_fw)), key=lambda x: x[-1], reverse=True)
+        scored_bw = sorted(list(zip(range(len(word_logprobs_bw)), word_logprobs_bw)), key=lambda x: x[-1], reverse=True)
+        word_ids_fw = [scored_w[0] for scored_w in scored_fw[:n_best]]
+        word_ids_bw = [scored_w[0] for scored_w in scored_bw[:n_best]]
+
+        n_intersect = 500
+        word_ids_intersect = list(set([w[0] for w in scored_bw][:n_intersect]).intersection(set([w[0] for w in scored_fw][:n_intersect])))
+
+        # Sanity-checking backward probabilities
+        # Loop through all words and print out top-n ranked words at each position
+        for idx in range(logprobs_bw.shape[0]):
+            word_logprobs = logprobs_bw[idx, :]
+            scored = sorted(list(zip(range(len(word_logprobs)), word_logprobs)), key=lambda x: x[-1], reverse=True)[:20]
+            scored_w = [self.vocab.inv_map[w[0]] for w in scored]
+            print('Top words at position {}:'.format(idx))
+            print(scored_w)
+            print()
+
+        return word_ids_fw, word_ids_bw, word_ids_intersect
 
     def time_sent_predictions(self, sent, n_loops=100):
         import time
@@ -150,6 +167,41 @@ class ModelPredictor(object):
         print('Max. inf. time:', max(times))
         print('Avg. inf. time:', sum(times) / len(times))
 
+
+def test_score_sent(model, sent, use_nltk=False):
+    print(sent)
+    output = model.score_sent(sent, use_nltk=use_nltk)
+    print('Log-prob of input sentence:')
+    print(output)
+
+def test_slot_filler(model, sent, word_idx, n_best=50):
+    # slot_word_ids = model.rank_slot_entries(sent=sent, word_idx=word_idx, n_best=n_best)
+    print(sent.strip().split()[:word_idx])
+    slot_word_ids_fw, slot_word_ids_bw, word_ids_intersect = model.rank_slot_entries(sent=sent, word_idx=word_idx, n_best=n_best)
+    print('Best Forward Word IDs:')
+    print(slot_word_ids_fw)
+    print('Best Backward Word IDs:')
+    print(slot_word_ids_bw)
+    print('Best Intersected Words:')
+    print(word_ids_intersect[:50])
+    print('Number of intersected words in top-k')
+    print(len(word_ids_intersect))
+    print(sent.split()[:word_idx])
+    print()
+    print('Candidate slot words:')
+    slot_words_fw = [model.vocab.inv_map[w_id] for w_id in slot_word_ids_fw]
+    slot_words_bw = [model.vocab.inv_map[w_id] for w_id in slot_word_ids_bw]
+    slot_words_intersect = [model.vocab.inv_map[w_id] for w_id in word_ids_intersect[:50]]
+    print("Forward suggestions:")
+    print(slot_words_fw)
+    print()
+    print("Backward suggestions:")
+    print(slot_words_bw)
+    print()
+    print('Intersected suggestions:')
+    print(slot_words_intersect)
+    print()
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--graph_file')
@@ -159,51 +211,42 @@ if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
     model_predictor = ModelPredictor(args)
-    print('Model instantiated!')
+    # print('Model instantiated!')
 
     # Test inference
     sent1 = 'Trump told White House counsel that he wanted to order the Justice Department to prosecute his political adversaries.'
-    output = model_predictor.score_sent(sent1, use_nltk=True)
-    print('Log-prob of dummy sentence 1:')
-    print(output)
-    # print(len(output))
-    # print(sum(output) / len(output))
-    # print(sum(output))
+    test_score_sent(model_predictor, sent1, use_nltk=True)
     print()
 
     sent2 = "best site for facebook likes , twitter and youtube likes . register here : it's free . :-)"
-    output2 = model_predictor.score_sent(sent2, use_nltk=False)
-    print('Log-prob of dummy sentence 2:')
-    print(output2)
-    # print(len(output2))
-    # print(sum(output2) / len(output2))
-    # print(sum(output2))
+    test_score_sent(model_predictor, sent2)
     print()
 
     sent3 = "sweet 16 Emoji_75 gonna be awesome ♥"
-    output3 = model_predictor.score_sent(sent3, use_nltk=False)
-    print('Log-prob of dummy sentence 3:')
-    print(output3)
-    # print(len(output3))
-    # print(sum(output3) / len(output3))
-    # print(sum(output3))
+    test_score_sent(model_predictor, sent3)
     print()
 
-    sent4 = "sweet 16 Emoji_75 gonna be dopeness ♥"
-    output4 = model_predictor.score_sent(sent4, use_nltk=False)
-    print('Log-prob of dummy sentence 4:')
-    print(output4)
+    sent4 = "sweet 16 Emoji_75 gonna be sweet ♥"
+    test_score_sent(model_predictor, sent4)
+    print()
+
+    test_score_sent(model_predictor, "sweet 16 Emoji_75 gonna be erratic ♥")
+    print()
+
+    test_score_sent(model_predictor, "sweet 16 Emoji_75 gonna be weird ♥")
     print()
 
     sent5 = "i'm so sad my sister is going to school tomorrow . i feel like crying :("
+    test_score_sent(model_predictor, sent5)
+    print()
 
     # Get ranked output for a slot in sentence
-    word_idx = 5
-    slot_word_ids = model_predictor.rank_slot_entries(sent=sent3, word_idx=word_idx, n_best=50)
-    print('Best Word IDs:')
-    print(slot_word_ids)
-    print(sent3.split()[:word_idx])
-    print()
-    print('Candidate slot words:')
-    slot_words = [model_predictor.vocab.inv_map[w_id] for w_id in slot_word_ids]
-    print(slot_words)
+    # test_slot_filler(model_predictor, sent5, 8)
+
+    # test_slot_filler(model_predictor, sent1, 9)
+
+    # test_slot_filler(model_predictor, sent5, 4)
+
+    test_slot_filler(model_predictor, "hey thanks for following me on insta :) you're so pretty Emoji_75", 10)
+
+    test_slot_filler(model_predictor, "what was your biggest mistake ? — not gonna say it Emoji_75", 4)
